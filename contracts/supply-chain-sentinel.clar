@@ -21,6 +21,13 @@
 (define-constant ERR_PARTICIPANT_NOT_REGISTERED u204)
 (define-constant ERR_INVALID_CUSTODIAN u205)
 (define-constant ERR_METADATA_TOO_LONG u206)
+(define-constant ERR_EMPTY_STRING u207)
+(define-constant ERR_LOG_FULL u208)
+
+;; Constants for validation
+(define-constant MAX_LOG_ENTRIES u50)
+(define-constant MAX_LOCATION_LENGTH u64)
+(define-constant MAX_NOTES_LENGTH u128)
 
 ;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Data Storage       ;;
@@ -45,7 +52,6 @@
   notes: (string-ascii 128)
 }))
 
-
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Private Helper Functions        ;;
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -54,16 +60,46 @@
   (is-eq user CONTRACT_OWNER)
 )
 
+;; Validate string inputs to ensure they're not empty and within length limits
+(define-private (validate-location (location (string-ascii 64)))
+  (and
+    (> (len location) u0)
+    (<= (len location) MAX_LOCATION_LENGTH)
+  )
+)
+
+(define-private (validate-notes (notes (string-ascii 128)))
+  (and
+    (> (len notes) u0)
+    (<= (len notes) MAX_NOTES_LENGTH)
+  )
+)
+
 (define-private (add-log-entry (item-id uint) (custodian principal) (location (string-ascii 64)) (notes (string-ascii 128)))
-  (let ((new-log-entry {
-    custodian: custodian,
-    timestamp-burn-height: burn-block-height,
-    location: location,
-    notes: notes
-  }))
-    (let ((current-log (default-to (list) (map-get? provenance-log item-id))))
-      (map-set provenance-log item-id (unwrap! (as-max-len? (append current-log new-log-entry) u50) (err u0)))
-      (ok true)
+  (begin
+    ;; Validate inputs
+    (asserts! (validate-location location) (err ERR_EMPTY_STRING))
+    (asserts! (validate-notes notes) (err ERR_EMPTY_STRING))
+
+    (let ((new-log-entry {
+      custodian: custodian,
+      timestamp-burn-height: burn-block-height,
+      location: location,
+      notes: notes
+    }))
+      (let ((current-log (default-to (list) (map-get? provenance-log item-id))))
+        ;; Check if log is already at max capacity
+        (asserts! (< (len current-log) MAX_LOG_ENTRIES) (err ERR_LOG_FULL))
+
+        ;; Add new entry to log
+        (match (as-max-len? (append current-log new-log-entry) u50)
+          updated-log (begin
+            (map-set provenance-log item-id updated-log)
+            (ok true)
+          )
+          (err ERR_LOG_FULL)
+        )
+      )
     )
   )
 )
@@ -85,6 +121,16 @@
 ;; Check if a principal is a registered participant
 (define-read-only (is-participant-registered (who principal))
   (is-some (map-get? participants who))
+)
+
+;; Get the current item count
+(define-read-only (get-last-item-id)
+  (var-get last-item-id)
+)
+
+;; Check if an item exists
+(define-read-only (item-exists (item-id uint))
+  (is-some (nft-get-owner? supply-item item-id))
 )
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -113,7 +159,6 @@
   )
 )
 
-
 ;; A registered participant can register a new item/batch on the blockchain.
 ;; This mints a new NFT and creates its initial provenance log entry.
 ;; @param initial-location: A string describing the origin location.
@@ -121,12 +166,17 @@
 (define-public (register-new-item (initial-location (string-ascii 64)) (initial-notes (string-ascii 128)))
   (begin
     (asserts! (is-some (map-get? participants tx-sender)) (err ERR_PARTICIPANT_NOT_REGISTERED))
+
+    ;; Pre-validate inputs before processing
+    (asserts! (validate-location initial-location) (err ERR_EMPTY_STRING))
+    (asserts! (validate-notes initial-notes) (err ERR_EMPTY_STRING))
+
     (let ((item-id (+ u1 (var-get last-item-id))))
       ;; Mint the NFT to the creator (the first custodian)
-      (unwrap! (nft-mint? supply-item item-id tx-sender) (err ERR_UNAUTHORIZED)) ;; Should not fail if logic is correct
+      (try! (nft-mint? supply-item item-id tx-sender))
       (var-set last-item-id item-id)
 
-      ;; Create the first log entry
+      ;; Create the first log entry (inputs already validated)
       (try! (add-log-entry item-id tx-sender initial-location initial-notes))
 
       (print {
@@ -148,15 +198,19 @@
 ;; @param transfer-notes: Notes regarding the transfer.
 (define-public (transfer-custody (item-id uint) (new-custodian principal) (new-location (string-ascii 64)) (transfer-notes (string-ascii 128)))
   (let ((current-owner (unwrap! (nft-get-owner? supply-item item-id) (err ERR_ITEM_NOT_FOUND))))
-    ;; Check permissions
+    ;; Check permissions and validate inputs
     (asserts! (is-eq tx-sender current-owner) (err ERR_NOT_OWNER))
     (asserts! (is-some (map-get? participants new-custodian)) (err ERR_PARTICIPANT_NOT_REGISTERED))
     (asserts! (not (is-eq tx-sender new-custodian)) (err ERR_INVALID_CUSTODIAN))
 
-    ;; Transfer the NFT
-    (unwrap! (nft-transfer? supply-item item-id tx-sender new-custodian) (err ERR_UNAUTHORIZED))
+    ;; Pre-validate string inputs
+    (asserts! (validate-location new-location) (err ERR_EMPTY_STRING))
+    (asserts! (validate-notes transfer-notes) (err ERR_EMPTY_STRING))
 
-    ;; Add a new log entry for the transfer
+    ;; Transfer the NFT
+    (try! (nft-transfer? supply-item item-id tx-sender new-custodian))
+
+    ;; Add a new log entry for the transfer (inputs already validated)
     (try! (add-log-entry item-id new-custodian new-location transfer-notes))
 
     (print {
